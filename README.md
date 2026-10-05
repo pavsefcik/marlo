@@ -1,32 +1,46 @@
 # marlo
 
 A local, on-device assistant for macOS, built on Apple's **Foundation Models**
-framework. No network, no API keys, no `fm serve` process.
-
-This repository is the working prototype: a CLI agent loop with real tool
-calling, streaming, approval gating, long-term memory, and context accounting.
-It is the foundation for a SwiftUI menu-bar app.
+framework. No cloud, no API keys, no `fm serve` process. Ships as a **SwiftUI
+menu-bar app** plus a scriptable **CLI** that share one agent.
 
 Tools run against real data. `getWeather` calls the free, keyless
-[Open-Meteo](https://open-meteo.com) API (geocoding + current conditions);
-`getCurrentTime` uses the system clock; memory is a local JSONL file. Nothing is
-faked — if a tool cannot reach its source, it says so instead of inventing an
-answer.
+[Open-Meteo](https://open-meteo.com) API; `getCurrentTime` uses the system clock;
+memory is a local JSONL file. Nothing is faked — if a tool cannot reach its
+source, it says so instead of inventing an answer.
 
 ```
-marlo/                 Swift package (this prototype)
-  Sources/Marlo/
-    main.swift              CLI: REPL, one-shot, piped input
-    Agent.swift             session, streaming, retries, tool bridging
-    AssistantTool.swift     tool definitions + memory store
-    HandRolledGenerable.swift  Generable conformances (macro-free)
+marlo/
+  Sources/MarloKit/          shared library
+    Agent.swift                session, streaming, retries, tool bridging
+    AssistantTool.swift        tool definitions + memory store
+    Arguments.swift            Generable argument types (@Generable + @Guide)
+  Sources/MarloUI/           SwiftUI menu-bar app
+    MarloApp.swift             MenuBarExtra scene, status bar, settings
+    ChatViewModel.swift        agent ↔ SwiftUI bridge
+    Views.swift                transcript, tool cards, approval sheet
+  Sources/MarloCLI/          the CLI
+    main.swift                 REPL, one-shot, piped input, --selftest
 ```
 
 ## Quick start
 
 ```bash
-cd marlo
 swift build
+
+# The app: a marlo icon in the menu bar
+swift run MarloApp
+
+# The CLI
+swift run marlo --selftest        # call every tool directly, no model
+swift run marlo "What's the weather in Tokyo?"
+swift run marlo                   # interactive session
+echo "What time is it in UTC?" | swift run marlo
+```
+
+Requirements: macOS 27, Apple Intelligence enabled, and `fm license` accepted
+(`sudo fm license`). **Xcode is required** — `Arguments.swift` uses the
+`@Generable` macro, whose compiler plugin ships only in Xcode.
 
 ./.build/debug/marlo --selftest        # call every tool directly, no model
 ./.build/debug/marlo "What's the weather in Tokyo?"
@@ -35,7 +49,7 @@ echo "What time is it in UTC?" | ./.build/debug/marlo
 ```
 
 Requirements: macOS 27, Apple Intelligence enabled, and `fm license` accepted
-(`sudo fm license`). Command Line Tools are enough — see **Xcode** below.
+(`sudo fm license`). See the top of this file for the Xcode requirement.
 
 In-session commands: `/new`, `/tools`, `/tools on|off|only|all|none <names>`,
 `/offline`, `/tokens`, `/help`, `/quit`.
@@ -178,10 +192,19 @@ the model.
 same moment a direct framework call answered fine. Retry-with-backoff is worth
 having, but overflow must be excluded from it (see 2).
 
-**4. Streaming rewrites, not just appends.**
-`ResponseStream` yields cumulative snapshots. `Agent.stream` emits a delta when a
-snapshot extends the previous one, and re-emits the whole text when it rewrites
-it. A rich UI should re-render from the full snapshot instead.
+**4. Snapshots are cumulative, and the UI contract now says so.**
+`ResponseStream` yields the **complete** text so far, not deltas. `Agent.send`
+reports a `ResponseSnapshot` carrying that full text plus an `isRewrite` flag,
+and callers render it by **replacement**. Appending deltas is the wrong model: a
+snapshot may revise text already emitted.
+
+Honest caveat: I could not reproduce a rewrite. Against this build, 18 probes
+across reasoning, list and self-revision prompts produced 0 rewrites — every
+snapshot extended the last one. So the replacement contract is right on the
+merits (it is what the API provides and cannot corrupt output), but the specific
+harm of appending deltas is *unverified here*, not demonstrated. The terminal
+adapter (`AppendOnlyRenderer`) keeps the delta behaviour for a medium that cannot
+un-print.
 
 **5. Tool schemas cost context every turn.**
 `/tokens` reports conversation + tool schema cost. With four tools and default
@@ -190,33 +213,36 @@ user types anything. Keep tool descriptions short and the tool count low.
 
 ## Xcode
 
-The `@Generable` macro cannot be expanded with Command Line Tools alone
-(`plugin for module 'FoundationModelsMacros' not found`), because the compiler
-plugin ships inside Xcode. `HandRolledGenerable.swift` writes out what the macro
-would synthesize, so the project builds and runs today.
+`Arguments.swift` uses the `@Generable` and `@Guide` macros, which expand via the
+`FoundationModelsMacros` plugin that ships **only inside Xcode**. With Command
+Line Tools alone the build fails with `plugin for module 'FoundationModelsMacros'
+not found`.
 
-`FoundationModels` itself, `SwiftUI`, and streaming all work CLT-only. Xcode is
-needed for the macros, Previews, Instruments, and any signed/distributable build.
-Installing it removes the hand-rolled conformances; no other change is required.
+An earlier revision of this project hand-wrote those conformances
+(`init(_:GeneratedContent)`, `generationSchema`, `generatedContent`) so it would
+build CLT-only. With Xcode available those ~400 lines are gone, and `@Guide`
+descriptions are now attached where they belong — to the field they describe.
+Xcode also brings Previews and Instruments.
 
-6. **A stub that looks real is worse than an error.** The first version of
-   `getWeather` returned a hardcoded `22°C and clear` for every city. The tool
-   call was genuinely happening, so output *looked* correct — including a
-   `(demo data)` suffix on stderr that the model silently dropped when it
-   restated the result as fact. If a tool cannot get real data, it must fail
-   loudly, never fabricate.
+## The UI
 
-7. **Silent decode failures read as "no data".** Three separate bugs hid behind
-   `try?`-swallowed `DecodingError`s: airport coordinates arriving as strings
-   (`"40.639928"`) instead of numbers, `daylight_duration` returning a fraction
-   (`40304.48`) while declared `[Int]`, and Wikipedia titles being
-   double-encoded (`%20` → `%2520`) so every multi-word lookup 404'd while
-   single-word ones worked. `HTTP.getJSON` now reports the failing field and
-   service, and `--selftest` exercises every tool.
+`MarloApp` is a `MenuBarExtra` with `.window` style: click the menu-bar icon for a
+resizable panel, no Dock icon, no window to manage. `Window` id `main` gives a
+full window for long sessions; `Settings` puts tool and network switches in the
+standard ⌘, location.
 
-8. **Use `percentEncodedPath`, not `path`.** Assigning an already-escaped string
-   to `URLComponents.path` re-encodes `%`, silently corrupting any URL with a
-   space in it.
+Two things about the design are deliberate:
+
+- **The transcript renders snapshots by replacement, never by appending.**
+  `ChatViewModel.streamingText` is assigned from each `ResponseSnapshot`, so a
+  revision cannot corrupt what is on screen.
+- **Approval is `async`.** `ToolEventSink.ApprovalHandler` returns via
+  `await`, and the SwiftUI sheet resumes a `CheckedContinuation`. A synchronous
+  handler would have to block a thread inside the agent actor, which can
+  deadlock it — and the CLI could not keep its blocking `readLine()` prompt.
+
+Read-only tools run without asking. `rememberFact` is the one mutating tool, and
+it raises an approval sheet showing its exact arguments and a Cancel/Allow pair.
 
 ## Safety and licensing
 
@@ -227,12 +253,13 @@ personal use; do not wrap it in a proxy or ship it commercially.
 
 ## Next steps
 
-1. `marlo-ui`: SwiftUI `MenuBarExtra` app with a global hotkey, snapshot
-   streaming, tool cards, and a context meter.
-2. Tool approval cards showing arguments and a diff before a mutating tool runs.
+1. A global hotkey (⌥Space) to summon the panel without reaching for the icon.
+2. Package a real `.app` bundle: Info.plist with `LSUIElement`, an icon, and
+   codesigning. Today `swift run MarloApp` works but has no bundle identity, so
+   notifications and login-item registration are unavailable.
 3. Persist transcripts (the framework's `Transcript` type is `Codable`) with a
    session sidebar.
 4. More tools: files, shell, web fetch, clipboard — read-only by default.
 5. Auto-summarize old turns as the context window fills instead of hard-failing.
-6. Add `marlo selftest` to CI so no tool regresses into a stub or a silent
+6. Run `marlo --selftest` in CI so no tool regresses into a stub or a silent
    decode failure.

@@ -15,7 +15,7 @@ import FoundationModels
 ///
 /// This mirrors Anthropic's tool-use model closely: a declared input schema, a
 /// description telling the model when to reach for it, and a function to run.
-protocol AssistantTool: Sendable {
+public protocol AssistantTool: Sendable {
     associatedtype Arguments: Generable
 
     /// Name the model sees and calls.
@@ -29,20 +29,20 @@ protocol AssistantTool: Sendable {
 }
 
 extension AssistantTool {
-    var isMutating: Bool { false }
+    public var isMutating: Bool { false }
 }
 
 // MARK: - Type erasure
 
 /// Lets `Agent` hold a heterogeneous tool list and bridge each entry to a
 /// framework `Tool` once a `ToolEventSink` exists.
-struct AnyAssistantTool: Sendable {
-    let name: String
-    let summary: String
-    let isMutating: Bool
+public struct AnyAssistantTool: Sendable {
+    public let name: String
+    public let summary: String
+    public let isMutating: Bool
     let bridge: @Sendable (ToolEventSink) -> any Tool
 
-    init<T: AssistantTool>(_ tool: T) {
+    public init<T: AssistantTool>(_ tool: T) {
         self.name = tool.name
         self.summary = tool.summary
         self.isMutating = tool.isMutating
@@ -62,7 +62,7 @@ struct BridgedTool<T: AssistantTool>: Tool {
         let rendered = arguments.generatedContent.jsonString
         sink.emit(.toolStarted(name: base.name, arguments: rendered))
 
-        if base.isMutating, !sink.requestApproval(name: base.name, arguments: rendered) {
+        if base.isMutating, await !sink.requestApproval(name: base.name, arguments: rendered) {
             let denial = "error: the user declined to run this tool"
             sink.emit(.toolFinished(name: base.name, result: denial))
             return denial
@@ -84,12 +84,12 @@ struct BridgedTool<T: AssistantTool>: Tool {
 
 // MARK: - Shared HTTP client
 
-enum ToolNetworkError: LocalizedError {
+public enum ToolNetworkError: LocalizedError {
     case unreachable(String)
     case badStatus(Int)
     case malformed
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .unreachable(let detail): "the service could not be reached (\(detail))"
         case .badStatus(let code): "the service returned HTTP \(code)"
@@ -100,16 +100,16 @@ enum ToolNetworkError: LocalizedError {
 
 /// A response that arrived but did not match the expected shape. Named
 /// separately from a network failure so bugs surface as bugs.
-struct ToolDecodeError: LocalizedError {
+public struct ToolDecodeError: LocalizedError {
     var service: String
     var detail: String
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         "\(service) returned data in an unexpected shape (\(detail))"
     }
 }
 
-enum HTTP {
+public enum HTTP {
     static let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 12
@@ -208,18 +208,20 @@ enum HTTP {
 
 // MARK: - getCurrentTime
 
-struct CurrentTimeTool: AssistantTool {
-    let name = "getCurrentTime"
-    let summary = "Get the current date and time. Use for any question about today, now, or the time."
+public struct CurrentTimeTool: AssistantTool {
+    public let name = "getCurrentTime"
 
-    typealias Arguments = TimeArguments
+    public init() {}
+    public let summary = "Get the current date and time. Use for any question about today, now, or the time."
 
-    func run(_ arguments: TimeArguments) async throws -> String {
+    public typealias Arguments = TimeArguments
+
+    public func run(_ arguments: TimeArguments) async throws -> String {
         guard let zone = TimeZone(identifier: arguments.timeZone) else {
             // Returned as the tool result, not thrown, so the model can recover.
             return "error: unknown time zone '\(arguments.timeZone)'. Use an IANA identifier such as Europe/Berlin or UTC."
         }
-        var formatter = DateFormatter()
+        let formatter = DateFormatter()
         formatter.timeZone = zone
         formatter.dateStyle = .full
         formatter.timeStyle = .short
@@ -229,16 +231,18 @@ struct CurrentTimeTool: AssistantTool {
 
 // MARK: - getWeather
 
-struct WeatherTool: AssistantTool {
-    let name = "getWeather"
-    let summary = """
+public struct WeatherTool: AssistantTool {
+    public let name = "getWeather"
+
+    public init() {}
+    public let summary = """
     Get the current real-world weather for a city. Use for any question about \
     weather, temperature, or conditions. Pass a plain city name.
     """
 
-    typealias Arguments = WeatherArguments
+    public typealias Arguments = WeatherArguments
 
-    func run(_ arguments: WeatherArguments) async throws -> String {
+    public func run(_ arguments: WeatherArguments) async throws -> String {
         // Open-Meteo: free, no account, no API key.
         let useFahrenheit = arguments.unit.lowercased().hasPrefix("f")
 
@@ -266,7 +270,7 @@ enum WeatherLookupError: LocalizedError {
     case unreachable(String)
     case malformed
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .cityNotFound(let query): "no city named '\(query)' was found"
         case .unreachable(let detail): "the weather service could not be reached (\(detail))"
@@ -399,19 +403,19 @@ struct ForecastResponse: Decodable {
 // MARK: - Long-term memory
 
 /// A plain newline-delimited file the model can read and append to.
-struct MemoryStore: Sendable {
+public struct MemoryStore: Sendable {
     let url: URL
 
-    init(url: URL = MemoryStore.defaultURL) {
+    public init(url: URL = MemoryStore.defaultURL) {
         self.url = url
     }
 
-    static var defaultURL: URL {
+    public static var defaultURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("marlo/memory.jsonl")
     }
 
-    func remember(_ text: String) throws {
+    public func remember(_ text: String) throws {
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
@@ -433,7 +437,7 @@ struct MemoryStore: Sendable {
         }
     }
 
-    func recall(matching query: String) throws -> [String] {
+    public func recall(matching query: String) throws -> [String] {
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
         let contents = try String(contentsOf: url, encoding: .utf8)
         let words = query.lowercased()
@@ -456,28 +460,32 @@ struct MemoryStore: Sendable {
     }
 }
 
-struct RememberFactTool: AssistantTool {
-    let name = "rememberFact"
-    let summary = "Save one fact about the user to long-term memory. Use when the user says to remember something."
-    let isMutating = true
+public struct RememberFactTool: AssistantTool {
+    public let name = "rememberFact"
+    public let summary = "Save one fact about the user to long-term memory. Use when the user says to remember something."
+    public let isMutating = true
 
-    typealias Arguments = RememberArguments
-    let store: MemoryStore
+    public typealias Arguments = RememberArguments
+    public let store: MemoryStore
 
-    func run(_ arguments: RememberArguments) async throws -> String {
+    public init(store: MemoryStore) { self.store = store }
+
+    public func run(_ arguments: RememberArguments) async throws -> String {
         try store.remember(arguments.text)
         return "Stored: \(arguments.text)"
     }
 }
 
-struct RecallMemoryTool: AssistantTool {
-    let name = "recallMemory"
-    let summary = "Search saved notes for facts the user previously asked to remember."
-    let store: MemoryStore
+public struct RecallMemoryTool: AssistantTool {
+    public let name = "recallMemory"
+    public let summary = "Search saved notes for facts the user previously asked to remember."
+    public let store: MemoryStore
 
-    typealias Arguments = RecallArguments
+    public init(store: MemoryStore) { self.store = store }
 
-    func run(_ arguments: RecallArguments) async throws -> String {
+    public typealias Arguments = RecallArguments
+
+    public func run(_ arguments: RecallArguments) async throws -> String {
         let hits = try store.recall(matching: arguments.query)
         return hits.isEmpty ? "no stored facts matched that query" : hits.joined(separator: "\n")
     }
@@ -485,17 +493,19 @@ struct RecallMemoryTool: AssistantTool {
 
 // MARK: - wikipediaSummary
 
-struct WikipediaTool: AssistantTool {
-    let name = "wikipediaSummary"
-    let summary = """
+public struct WikipediaTool: AssistantTool {
+    public let name = "wikipediaSummary"
+
+    public init() {}
+    public let summary = """
     Look up an encyclopedic summary and basic facts about a person, place, \
     country, company, invention or event. Use for 'who is', 'what is' and \
     'tell me about' questions rather than answering from memory.
     """
 
-    typealias Arguments = WikipediaArguments
+    public typealias Arguments = WikipediaArguments
 
-    func run(_ arguments: WikipediaArguments) async throws -> String {
+    public func run(_ arguments: WikipediaArguments) async throws -> String {
         guard let summary = try? await Wikipedia.summary(of: arguments.subject) else {
             return "error: nothing was found for '\(arguments.subject)'"
         }
@@ -560,16 +570,18 @@ struct SearchResponse: Decodable {
 
 // MARK: - convertCurrency
 
-struct CurrencyTool: AssistantTool {
-    let name = "convertCurrency"
-    let summary = """
+public struct CurrencyTool: AssistantTool {
+    public let name = "convertCurrency"
+
+    public init() {}
+    public let summary = """
     Convert an amount between currencies using current reference exchange rates. \
     Use for any money conversion or exchange-rate question.
     """
 
-    typealias Arguments = ExchangeRateArguments
+    public typealias Arguments = ExchangeRateArguments
 
-    func run(_ arguments: ExchangeRateArguments) async throws -> String {
+    public func run(_ arguments: ExchangeRateArguments) async throws -> String {
         let from = arguments.fromCurrency.uppercased()
         let to = arguments.toCurrency.uppercased()
 
@@ -599,13 +611,15 @@ struct RateResponse: Decodable {
 
 // MARK: - getCryptoPrice
 
-struct CryptoPriceTool: AssistantTool {
-    let name = "getCryptoPrice"
-    let summary = "Get the current spot price in US dollars for a cryptocurrency such as BTC, ETH or SOL."
+public struct CryptoPriceTool: AssistantTool {
+    public let name = "getCryptoPrice"
 
-    typealias Arguments = CryptoPriceArguments
+    public init() {}
+    public let summary = "Get the current spot price in US dollars for a cryptocurrency such as BTC, ETH or SOL."
 
-    func run(_ arguments: CryptoPriceArguments) async throws -> String {
+    public typealias Arguments = CryptoPriceArguments
+
+    public func run(_ arguments: CryptoPriceArguments) async throws -> String {
         let symbol = arguments.coin.uppercased()
         let url = URL(string: "https://api.coinbase.com/v2/prices/\(symbol)-USD/spot")!
 
@@ -622,13 +636,15 @@ struct CryptoPriceTool: AssistantTool {
 
 // MARK: - airQuality
 
-struct AirQualityTool: AssistantTool {
-    let name = "airQuality"
-    let summary = "Get the current air quality and pollution level for a city."
+public struct AirQualityTool: AssistantTool {
+    public let name = "airQuality"
 
-    typealias Arguments = CityArguments
+    public init() {}
+    public let summary = "Get the current air quality and pollution level for a city."
 
-    func run(_ arguments: CityArguments) async throws -> String {
+    public typealias Arguments = CityArguments
+
+    public func run(_ arguments: CityArguments) async throws -> String {
         let place = try await OpenMeteo.geocode(arguments.city)
 
         var components = URLComponents(string: "https://air-quality-api.open-meteo.com/v1/air-quality")!
@@ -669,13 +685,15 @@ struct AirQualityResponse: Decodable {
 
 // MARK: - sunriseSunset
 
-struct SunTool: AssistantTool {
-    let name = "sunriseSunset"
-    let summary = "Get today's sunrise, sunset and daylight length for a city."
+public struct SunTool: AssistantTool {
+    public let name = "sunriseSunset"
 
-    typealias Arguments = CityArguments
+    public init() {}
+    public let summary = "Get today's sunrise, sunset and daylight length for a city."
 
-    func run(_ arguments: CityArguments) async throws -> String {
+    public typealias Arguments = CityArguments
+
+    public func run(_ arguments: CityArguments) async throws -> String {
         let place = try await OpenMeteo.geocode(arguments.city)
 
         var components = URLComponents(string: "https://api.open-meteo.com/v1/forecast")!
@@ -721,13 +739,15 @@ struct SunResponse: Decodable {
 
 // MARK: - recentEarthquakes
 
-struct EarthquakeTool: AssistantTool {
-    let name = "recentEarthquakes"
-    let summary = "List recent significant earthquakes worldwide from the US Geological Survey."
+public struct EarthquakeTool: AssistantTool {
+    public let name = "recentEarthquakes"
 
-    typealias Arguments = EarthquakeArguments
+    public init() {}
+    public let summary = "List recent significant earthquakes worldwide from the US Geological Survey."
 
-    func run(_ arguments: EarthquakeArguments) async throws -> String {
+    public typealias Arguments = EarthquakeArguments
+
+    public func run(_ arguments: EarthquakeArguments) async throws -> String {
         let days = max(1, min(arguments.withinDays, 30))
         let start = ISO8601DateFormatter().string(
             from: Date().addingTimeInterval(-Double(days) * 86_400)
@@ -773,13 +793,15 @@ struct QuakeResponse: Decodable {
 
 // MARK: - upcomingPublicHolidays
 
-struct HolidayTool: AssistantTool {
-    let name = "upcomingPublicHolidays"
-    let summary = "List upcoming public holidays for a country."
+public struct HolidayTool: AssistantTool {
+    public let name = "upcomingPublicHolidays"
 
-    typealias Arguments = HolidayArguments
+    public init() {}
+    public let summary = "List upcoming public holidays for a country."
 
-    func run(_ arguments: HolidayArguments) async throws -> String {
+    public typealias Arguments = HolidayArguments
+
+    public func run(_ arguments: HolidayArguments) async throws -> String {
         let code = try await CountryCodes.resolve(arguments.country)
 
         let url = URL(string: "https://date.nager.at/api/v3/NextPublicHolidays/\(code)")!
@@ -856,9 +878,11 @@ enum CountryCodes {
 /// quota is roughly 400 credits/day, and a single departure query costs several.
 /// Probing exhausted it and returned `429` with an 86,201-second retry. adsb.lol
 /// has no such limit in testing.
-struct AirTrafficTool: AssistantTool {
-    let name = "liveAirTraffic"
-    let summary = """
+public struct AirTrafficTool: AssistantTool {
+    public let name = "liveAirTraffic"
+
+    public init() {}
+    public let summary = """
     Show aircraft currently transmitting near an airport, from live ADS-B data. \
     Use for 'what is flying near/around <airport>' questions. Give the airport \
     code (JFK, LHR) or its name (Heathrow). This reports aircraft observed in \
@@ -867,9 +891,9 @@ struct AirTrafficTool: AssistantTool {
     not use it to answer questions about upcoming flights.
     """
 
-    typealias Arguments = AirportArguments
+    public typealias Arguments = AirportArguments
 
-    func run(_ arguments: AirportArguments) async throws -> String {
+    public func run(_ arguments: AirportArguments) async throws -> String {
         let query = arguments.airport.trimmingCharacters(in: .whitespaces)
 
         guard let airport = try await Airports.lookup(query: query) else {

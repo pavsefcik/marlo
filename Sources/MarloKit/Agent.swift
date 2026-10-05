@@ -2,10 +2,60 @@ import Foundation
 import FoundationModels
 
 /// Anything the assistant does that an interface may want to show, log, or gate.
-enum AgentEvent: Sendable {
+public enum AgentEvent: Sendable {
     case toolStarted(name: String, arguments: String)
     case toolFinished(name: String, result: String)
     case modelRetry(attempt: Int, reason: String)
+}
+
+/// One update from the model while it is producing an answer.
+///
+/// `text` is the **complete** response so far, not a delta. Callers must replace
+/// whatever they were showing with this value rather than appending, because the
+/// model can revise text it already emitted: a reasoning trace can be dropped
+/// once the answer is settled, and a partially-typed word can be completed
+/// differently. Appending deltas therefore produces corrupted output that no
+/// amount of terminal cleverness fully repairs.
+public struct ResponseSnapshot: Sendable {
+    /// The full response text produced so far.
+    public var text: String
+    /// True when this update changes text that was already emitted, rather than
+    /// extending it. Purely informational: replacing the rendered text is always
+    /// correct, and a terminal (which cannot un-print) may want to know so it can
+    /// start a fresh line instead of gluing a revision onto the old one.
+    public var isRewrite: Bool
+
+    public static let empty = ResponseSnapshot(text: "", isRewrite: false)
+}
+
+/// Bridges snapshot updates to something that can only append — a terminal.
+///
+/// A view should render `snapshot.text` directly. This exists for stream
+/// consumers that have already painted the previous text and cannot take it
+/// back, so it prints the smallest sane thing: the extension for an append, and
+/// the whole text on a fresh line for a rewrite.
+public final class AppendOnlyRenderer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var printed = ""
+    private let write: @Sendable (String) -> Void
+
+    public init(write: @escaping @Sendable (String) -> Void) {
+        self.write = write
+    }
+
+    public func render(_ snapshot: ResponseSnapshot) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if snapshot.isRewrite {
+            // A terminal cannot un-print earlier output. Reprint the revision on
+            // its own line rather than splicing it into what is already shown.
+            write("\n" + snapshot.text)
+        } else if snapshot.text.count > printed.count {
+            write(String(snapshot.text.dropFirst(printed.count)))
+        }
+        printed = snapshot.text
+    }
 }
 
 /// Bridges one `AssistantTool` into a framework `Tool`.
@@ -13,9 +63,14 @@ enum AgentEvent: Sendable {
 
 /// Callbacks an interface installs. A reference type so tools can report while
 /// the owning `Agent` actor stays isolated.
-final class ToolEventSink: @unchecked Sendable {
-    typealias EventHandler = @Sendable (AgentEvent) -> Void
-    typealias ApprovalHandler = @Sendable (_ name: String, _ arguments: String) -> Bool
+public final class ToolEventSink: @unchecked Sendable {
+    public init() {}
+
+    public typealias EventHandler = @Sendable (AgentEvent) -> Void
+    /// Approval is `async` on purpose. A UI cannot answer synchronously without
+    /// blocking a thread (and anything that blocks inside the agent actor can
+    /// deadlock it), so the decision is awaited instead.
+    public typealias ApprovalHandler = @Sendable (_ name: String, _ arguments: String) async -> Bool
 
     private let lock = NSLock()
     private var onEvent: EventHandler?
@@ -24,7 +79,7 @@ final class ToolEventSink: @unchecked Sendable {
     /// When true, mutating tools run without asking.
     private var autoApprove = false
 
-    func configure(
+    public func configure(
         onEvent: EventHandler?,
         onApproval: ApprovalHandler?,
         autoApprove: Bool = false
@@ -43,28 +98,34 @@ final class ToolEventSink: @unchecked Sendable {
         handler?(event)
     }
 
-    func requestApproval(name: String, arguments: String) -> Bool {
-        lock.lock()
-        let handler = onApproval
-        let approved = autoApprove
-        lock.unlock()
+    /// The handler is copied out under the lock and awaited *after* releasing it:
+    /// holding an `NSLock` across a suspension point is unsafe.
+    func requestApproval(name: String, arguments: String) async -> Bool {
+        let (handler, approved) = locked { ($0.onApproval, $0.autoApprove) }
         // `--yes` short-circuits the prompt entirely.
         if approved { return true }
         // With no handler installed (piping, scripting) mutating tools are
         // refused unless the caller opted in above.
         guard let handler else { return false }
-        return handler(name, arguments)
+        return await handler(name, arguments)
+    }
+
+    /// Read state without exposing the lock.
+    private func locked<T>(_ body: (ToolEventSink) -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(self)
     }
 }
 
 /// Why a turn failed, in terms an interface can act on.
-enum AgentFailure: LocalizedError {
+public enum AgentFailure: LocalizedError {
     case modelUnavailable(SystemLanguageModel.Availability.UnavailableReason)
     case contextOverflow(tokens: Int, limit: Int)
     case guardrailsExhausted(attempts: Int, underlying: String)
     case other(String)
 
-    var errorDescription: String? {
+    public var errorDescription: String? {
         switch self {
         case .modelUnavailable(let reason):
             switch reason {
@@ -103,7 +164,7 @@ enum AgentFailure: LocalizedError {
 /// validates arguments against the declared schema, runs `call(arguments:)`, and
 /// feeds the result back, looping until the model produces a final answer. There
 /// is no prompt-and-parse emulation.
-actor Agent {
+public actor Agent {
     private let model = SystemLanguageModel.default
     private let sink: ToolEventSink
     private let instructions: String
@@ -121,7 +182,7 @@ actor Agent {
     /// non-deterministic on-device, so one retry often succeeds.
     private let maxRetries = 2
 
-    init(
+    public init(
         definitions: [AnyAssistantTool],
         instructions: String = Agent.defaultInstructions,
         disabled: Set<String> = [],
@@ -138,7 +199,7 @@ actor Agent {
         self.session = LanguageModelSession(tools: tools, instructions: Instructions(instructions))
     }
 
-    init(
+    public init(
         tools: [AnyAssistantTool],
         instructions: String = Agent.defaultInstructions,
         disabled: Set<String> = []
@@ -146,9 +207,9 @@ actor Agent {
         self.init(definitions: tools, instructions: instructions, disabled: disabled)
     }
 
-    var toolNames: [String] { definitions.map(\.name) }
+    public var toolNames: [String] { definitions.map(\.name) }
 
-    func describeTools() -> [(name: String, summary: String, mutating: Bool, enabled: Bool)] {
+    public func describeTools() -> [(name: String, summary: String, mutating: Bool, enabled: Bool)] {
         definitions.map { ($0.name, $0.summary, $0.isMutating, !disabled.contains($0.name)) }
     }
 
@@ -156,7 +217,7 @@ actor Agent {
     /// it from the model's schema, so the model cannot call it and its tokens no
     /// longer count against the context window. Returns false for unknown names.
     @discardableResult
-    func setTool(_ name: String, enabled: Bool) -> Bool {
+    public func setTool(_ name: String, enabled: Bool) -> Bool {
         let known = Set(definitions.map(\.name))
         guard known.contains(name) else { return false }
         if enabled { disabled.remove(name) } else { disabled.insert(name) }
@@ -165,12 +226,12 @@ actor Agent {
     }
 
     /// Enable or disable every tool at once.
-    func setAllTools(enabled: Bool) {
+    public func setAllTools(enabled: Bool) {
         disabled = enabled ? [] : Set(definitions.map(\.name))
         rebuildSession()
     }
 
-    var enabledToolNames: [String] {
+    public var enabledToolNames: [String] {
         definitions.map(\.name).filter { !disabled.contains($0) }
     }
 
@@ -189,7 +250,7 @@ actor Agent {
     }
 
 
-    func configure(
+    public func configure(
         onEvent: ToolEventSink.EventHandler?,
         onApproval: ToolEventSink.ApprovalHandler?,
         autoApprove: Bool = false
@@ -197,26 +258,30 @@ actor Agent {
         sink.configure(onEvent: onEvent, onApproval: onApproval, autoApprove: autoApprove)
     }
 
-    var contextSize: Int { model.contextSize }
+    public var contextSize: Int { model.contextSize }
 
-    var availability: SystemLanguageModel.Availability { model.availability }
+    public var availability: SystemLanguageModel.Availability { model.availability }
 
     /// Tokens the conversation occupies, plus the tool schemas the model carries
     /// on every turn.
-    func usedTokens() async -> Int {
+    public func usedTokens() async -> Int {
         let conversation = (try? await model.tokenCount(for: session.transcript)) ?? 0
         let schemas = (try? await model.tokenCount(for: bridgedTools)) ?? 0
         return conversation + schemas
     }
 
-    func reset() {
+    public func reset() {
         session = LanguageModelSession(tools: bridgedTools, instructions: Instructions(instructions))
     }
 
-    /// One turn. Streams assistant text through `onText`, returns the final answer.
-    func send(
+    /// One turn. Reports every snapshot through `onSnapshot` and returns the
+    /// final answer text.
+    ///
+    /// `onSnapshot` receives the complete text so far, not a delta, so a view can
+    /// render it directly. See `ResponseSnapshot` for why that matters.
+    public func send(
         _ prompt: String,
-        onText: @Sendable (String) -> Void
+        onSnapshot: @Sendable (ResponseSnapshot) -> Void
     ) async throws -> String {
         // Classify overflow *before* asking the model. On this build an over-long
         // request surfaces as `.guardrailViolation` ("May contain unsafe
@@ -234,7 +299,7 @@ actor Agent {
 
         while attempt <= maxRetries {
             do {
-                return try await stream(prompt: prompt, onText: onText)
+                return try await stream(prompt: prompt, onSnapshot: onSnapshot)
             } catch let error as LanguageModelError {
                 switch error {
                 case .contextSizeExceeded(let details):
@@ -269,29 +334,26 @@ actor Agent {
 
     private func stream(
         prompt: String,
-        onText: @Sendable (String) -> Void
+        onSnapshot: @Sendable (ResponseSnapshot) -> Void
     ) async throws -> String {
         let stream = session.streamResponse(to: prompt)
-        var printed = ""
+        var previous = ""
         var final = ""
 
         for try await snapshot in stream {
             let text = snapshot.content
-            if text.hasPrefix(printed) {
-                let delta = String(text.dropFirst(printed.count))
-                if !delta.isEmpty { onText(delta) }
-            } else {
-                // The snapshot rewrote earlier text; surface it whole. A rich UI
-                // should re-render from the full snapshot instead.
-                onText(text)
-            }
-            printed = text
+            // A snapshot either extends what came before or revises it. Report
+            // the complete text either way; `isRewrite` is a hint for consumers
+            // that cannot overwrite what they already displayed.
+            let isRewrite = !text.hasPrefix(previous)
+            onSnapshot(ResponseSnapshot(text: text, isRewrite: isRewrite))
+            previous = text
             final = text
         }
         return final
     }
 
-    static let defaultInstructions = """
+    public static let defaultInstructions = """
     You are Marlo, a concise on-device assistant running locally on the user's Mac.
     Call the available tools whenever they give a more accurate answer than your
     own knowledge — the current time, weather, or anything the user asked you to

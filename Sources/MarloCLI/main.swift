@@ -1,5 +1,6 @@
 import Foundation
 import FoundationModels
+import MarloKit
 
 // MARK: - Terminal helpers
 
@@ -234,8 +235,12 @@ await agent.configure(
 // MARK: - A single turn
 
 func respond(to prompt: String) async {
+    // The terminal can only append, so route snapshots through the adapter.
+    let renderer = AppendOnlyRenderer { text in say(text) }
     do {
-        let answer = try await agent.send(prompt) { delta in say(delta) }
+        let answer = try await agent.send(prompt) { snapshot in
+            renderer.render(snapshot)
+        }
         if !answer.isEmpty { say("\n") }
     } catch {
         note("\n  ✗ \(error.localizedDescription)\n")
@@ -248,6 +253,17 @@ if options.selfTest {
 }
 
 // MARK: - Self test
+
+/// Build tool arguments from JSON.
+///
+/// `@Generable` synthesises `init(_ content: GeneratedContent)`, and declaring any
+/// initialiser suppresses Swift's implicit memberwise one — so
+/// `TimeArguments(timeZone: "UTC")` does not compile. Building through
+/// `GeneratedContent` also exercises the same decode path the model's output
+/// takes, which is what the self-test should be testing anyway.
+func args<T: Generable>(_ type: T.Type, _ json: String) throws -> T {
+    try T(GeneratedContent(json: json))
+}
 
 /// Calls every tool's implementation directly, bypassing the model. Catches the
 /// class of failure that keeps appearing: a tool whose result gets swallowed by
@@ -276,18 +292,18 @@ func runSelfTest() async {
         }
     }
 
-    await check("getCurrentTime") { try await CurrentTimeTool().run(TimeArguments(timeZone: "Asia/Tokyo")) }
-    await check("getWeather") { try await WeatherTool().run(WeatherArguments(city: "Lisbon", unit: "celsius")) }
-    await check("getWeather (fahrenheit)") { try await WeatherTool().run(WeatherArguments(city: "New York", unit: "fahrenheit")) }
-    await check("wikipediaSummary") { try await WikipediaTool().run(WikipediaArguments(subject: "Alan Turing")) }
-    await check("convertCurrency") { try await CurrencyTool().run(ExchangeRateArguments(amount: 100, fromCurrency: "EUR", toCurrency: "GBP")) }
-    await check("getCryptoPrice") { try await CryptoPriceTool().run(CryptoPriceArguments(coin: "BTC")) }
-    await check("airQuality") { try await AirQualityTool().run(CityArguments(city: "Delhi")) }
-    await check("sunriseSunset") { try await SunTool().run(CityArguments(city: "Oslo")) }
-    await check("recentEarthquakes") { try await EarthquakeTool().run(EarthquakeArguments(minimumMagnitude: 4.5, withinDays: 7)) }
-    await check("upcomingPublicHolidays") { try await HolidayTool().run(HolidayArguments(country: "France")) }
-    await check("liveAirTraffic (JFK)") { try await AirTrafficTool().run(AirportArguments(airport: "JFK")) }
-    await check("liveAirTraffic (by name)") { try await AirTrafficTool().run(AirportArguments(airport: "Heathrow")) }
+    await check("getCurrentTime") { try await CurrentTimeTool().run(try args(TimeArguments.self, #"{"timeZone": "Asia/Tokyo"}"#)) }
+    await check("getWeather") { try await WeatherTool().run(try args(WeatherArguments.self, #"{"city": "Lisbon", "unit": "celsius"}"#)) }
+    await check("getWeather (fahrenheit)") { try await WeatherTool().run(try args(WeatherArguments.self, #"{"city": "New York", "unit": "fahrenheit"}"#)) }
+    await check("wikipediaSummary") { try await WikipediaTool().run(try args(WikipediaArguments.self, #"{"subject": "Alan Turing"}"#)) }
+    await check("convertCurrency") { try await CurrencyTool().run(try args(ExchangeRateArguments.self, #"{"amount": 100, "fromCurrency": "EUR", "toCurrency": "GBP"}"#)) }
+    await check("getCryptoPrice") { try await CryptoPriceTool().run(try args(CryptoPriceArguments.self, #"{"coin": "BTC"}"#)) }
+    await check("airQuality") { try await AirQualityTool().run(try args(CityArguments.self, #"{"city": "Delhi"}"#)) }
+    await check("sunriseSunset") { try await SunTool().run(try args(CityArguments.self, #"{"city": "Oslo"}"#)) }
+    await check("recentEarthquakes") { try await EarthquakeTool().run(try args(EarthquakeArguments.self, #"{"minimumMagnitude": 4.5, "withinDays": 7}"#)) }
+    await check("upcomingPublicHolidays") { try await HolidayTool().run(try args(HolidayArguments.self, #"{"country": "France"}"#)) }
+    await check("liveAirTraffic (JFK)") { try await AirTrafficTool().run(try args(AirportArguments.self, #"{"airport": "JFK"}"#)) }
+    await check("liveAirTraffic (by name)") { try await AirTrafficTool().run(try args(AirportArguments.self, #"{"airport": "Heathrow"}"#)) }
 
     say("\n  \(passed) passed, \(failed) failed\n")
     if failed > 0 { exit(1) }

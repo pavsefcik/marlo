@@ -2,25 +2,37 @@
 import PackageDescription
 
 // MARLO — a local, on-device assistant built on Apple's Foundation Models
-// framework. Timeline:
+// framework.
 //
-//   marlo        — CLI agent loop (this target)
-//   marlo-ui     — SwiftUI menu-bar app (added once Xcode is installed, for
-//                 @Generable / @State macros and Previews)
+//   MarloKit  shared agent, tools, and streaming contract
+//   marlo     the CLI (scriptable; no GUI required)
+//   MarloApp  the SwiftUI app — a menu-bar extra
 //
-// Everything here builds with Command Line Tools alone. The only Xcode-only
-// piece is the FoundationModelsMacros plugin, so generable argument types are
-// hand-written in HandRolledGenerable.swift. See README.md.
+// MarloKit and the CLI build with Command Line Tools alone. Arguments.swift uses
+// the @Generable macro, which needs Xcode's FoundationModelsMacros plugin;
+// without Xcode, swap it for hand-written conformances (README, "Xcode").
 let package = Package(
     name: "marlo",
     platforms: [.macOS(.v27)],
     products: [
-        .executable(name: "marlo", targets: ["Marlo"])
+        .executable(name: "marlo", targets: ["marlo"]),
+        .executable(name: "MarloApp", targets: ["MarloApp"]),
+        .library(name: "MarloKit", targets: ["MarloKit"]),
     ],
     targets: [
+        .target(
+            name: "MarloKit",
+            path: "Sources/MarloKit"
+        ),
         .executableTarget(
-            name: "Marlo",
-            path: "Sources/Marlo"
-        )
+            name: "marlo",
+            dependencies: ["MarloKit"],
+            path: "Sources/MarloCLI"
+        ),
+        .executableTarget(
+            name: "MarloApp",
+            dependencies: ["MarloKit"],
+            path: "Sources/MarloUI"
+        ),
     ]
 )
