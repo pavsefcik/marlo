@@ -251,6 +251,9 @@ programmatic access to Apple's models. The supported path is a signed app using
 the framework directly — which is what this project is. It is intended for local,
 personal use; do not wrap it in a proxy or ship it commercially.
 
+That restriction is about Apple's models, not this repository's code: marlo is
+released under the MIT License (see [LICENSE](LICENSE)).
+
 ## Next steps
 
 1. A global hotkey (⌥Space) to summon the panel without reaching for the icon.
@@ -263,3 +266,7 @@ personal use; do not wrap it in a proxy or ship it commercially.
 5. Auto-summarize old turns as the context window fills instead of hard-failing.
 6. Run `marlo --selftest` in CI so no tool regresses into a stub or a silent
    decode failure.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
