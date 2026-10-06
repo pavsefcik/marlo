@@ -24,15 +24,27 @@ let package = Package(
             name: "MarloKit",
             path: "Sources/MarloKit"
         ),
+        // A tiny wrapper over the system readline (libedit) so the CLI gets
+        // history and tab completion. Swift cannot touch libedit's mutable
+        // globals under strict concurrency; C can.
+        .target(
+            name: "CReadline",
+            path: "Sources/CReadline"
+        ),
         .executableTarget(
             name: "marlo",
-            dependencies: ["MarloKit"],
+            dependencies: ["MarloKit", "CReadline"],
             path: "Sources/MarloCLI"
         ),
         .executableTarget(
             name: "MarloApp",
             dependencies: ["MarloKit"],
             path: "Sources/MarloUI"
+        ),
+        .testTarget(
+            name: "MarloKitTests",
+            dependencies: ["MarloKit"],
+            path: "Tests/MarloKitTests"
         ),
     ]
 )

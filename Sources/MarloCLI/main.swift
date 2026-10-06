@@ -25,6 +25,7 @@ struct Options {
     var autoApprove = false
     var instructions: String?
     var showHelp = false
+    var showVersion = false
     var selfTest = false
     /// Tool names the model may call. `nil` means every tool.
     var onlyTools: [String]?
@@ -45,6 +46,8 @@ func parse(_ arguments: [String]) -> Options {
         switch arguments[index] {
         case "-h", "--help":
             options.showHelp = true
+        case "-V", "--version":
+            options.showVersion = true
         case "-y", "--yes":
             options.autoApprove = true
         case "--selftest":
@@ -102,16 +105,24 @@ func usage() -> String {
       --without <a,b,c>          hide these tools
       --selftest                 exercise every tool directly and report
       -h, --help                 show this help
+      -V, --version              show the version
 
     IN-SESSION COMMANDS
-      /new     clear the conversation
-      /tools   list tools and whether each is enabled
-      /tools on|off <name>       enable/disable one tool
-      /tools only <a,b>|all|none  restrict, enable, or disable every tool
-      /offline [on|off]          toggle every network tool
-      /tokens  show context usage
-      /help    list commands
-      /quit    exit
+      Type / for the list, or tab-complete any command. ↑↓ walks history.
+      /help, /?              show the command list
+      /new, /clear           start a new conversation
+      /tools                 list tools and whether each is enabled
+      /tools on|off <names>  enable or disable tools
+      /tools only|all|none   restrict, enable, or disable every tool
+      /style [concise|balanced|expansive]
+      /offline [on|off]      toggle every network tool
+      /instructions [text|edit|reset]
+      /model [system|pcc]    show or switch the model
+      /save [name]           save this conversation
+      /sessions              list saved conversations
+      /resume [name]         resume one; no name reopens the newest
+      /tokens                show context usage
+      /quit, /exit, /q       leave
 
     EXAMPLES
       marlo --no-tools "explain photosynthesis"   answer from the model alone
@@ -126,17 +137,14 @@ if options.showHelp {
     exit(0)
 }
 
+if options.showVersion {
+    say(MarloVersion.line + "\n")
+    exit(0)
+}
+
 // MARK: - Tools
 
 let memory = MemoryStore()
-
-/// Tools that reach the network. `--offline` hides exactly these, so an offline
-/// session can still use the clock and memory but nothing leaves the machine.
-let networkToolNames: Set<String> = [
-    "getWeather", "wikipediaSummary", "convertCurrency", "getCryptoPrice",
-    "airQuality", "sunriseSunset", "recentEarthquakes",
-    "upcomingPublicHolidays", "liveAirTraffic",
-]
 
 let tools: [AnyAssistantTool] = [
     // Local / offline
@@ -158,25 +166,39 @@ let tools: [AnyAssistantTool] = [
 
 let knownToolNames = Set(tools.map(\.name))
 
-// Work out which tools start hidden: --offline, then --tools, then --without.
-var initialDisabledTools = Set<String>()
+/// Tools that reach the network, taken from the tools themselves. `--offline`
+/// hides exactly these, so an offline session can still use the clock and
+/// memory but nothing leaves the machine.
+let networkToolNames = Set(tools.filter(\.isNetwork).map(\.name))
 
+// Persisted preferences. A CLI run that names no tool flags respects them, so
+// the same choices a user makes in the app apply here too.
+let settingsStore = SettingsStore()
+var settings = settingsStore.current
+
+// Work out which tools are enabled for this run.
+//
+// Explicit flags win over the stored selection: `--tools` names exactly what
+// this run may use rather than being filtered by a preference set in the app.
+let enabledTools: Set<String>
 if options.noTools {
-    initialDisabledTools.formUnion(knownToolNames)
-}
-
-if options.offline {
-    initialDisabledTools.formUnion(networkToolNames)
-}
-
-if let only = options.onlyTools {
-    for name in knownToolNames where !only.contains(name) {
-        initialDisabledTools.insert(name)
-    }
+    enabledTools = []
+} else if let only = options.onlyTools {
+    enabledTools = Set(only).intersection(knownToolNames)
     let unknown = only.filter { !knownToolNames.contains($0) }
     if !unknown.isEmpty {
         note("marlo: unknown tool(s) in --tools: \(unknown.joined(separator: ", "))\n")
     }
+} else if settings.toolsEnabled {
+    enabledTools = settings.enabledTools.intersection(knownToolNames)
+} else {
+    enabledTools = []
+}
+
+var initialDisabledTools = knownToolNames.subtracting(enabledTools)
+
+if options.offline {
+    initialDisabledTools.formUnion(networkToolNames)
 }
 
 for name in options.withoutTools {
@@ -188,10 +210,16 @@ for name in options.withoutTools {
 }
 
 let agent = Agent(
-    tools: tools,
-    instructions: options.instructions ?? Agent.defaultInstructions,
-    disabled: initialDisabledTools
+    definitions: tools,
+    instructions: options.instructions ?? settings.instructions,
+    disabled: initialDisabledTools,
+    routingEnabled: !enabledTools.isEmpty,
+    routingThreshold: settings.routingThreshold,
+    styleInstruction: settings.responseStyle.instruction,
+    model: settings.model
 )
+
+let sessionStore = SessionStore()
 
 // MARK: - Preflight
 
@@ -219,6 +247,9 @@ await agent.configure(
             note("  ✓ \(name) → \(preview)\n\n")
         case .modelRetry(let attempt, let reason):
             note("  ↻ retrying (\(attempt)) after \(reason)\n")
+        case .routing(let chosen, let fallback):
+            let list = chosen.isEmpty ? "none" : chosen.joined(separator: ", ")
+            note("  ⇢ tools: \(list)\(fallback ? " (routing failed, using all)" : "")\n")
         }
     },
     onApproval: { name, arguments in
@@ -325,121 +356,73 @@ if !isInteractive {
 
 // MARK: - Interactive session
 
-note("marlo — on-device assistant · context \(await agent.contextSize) tokens · type /help for commands\n\n")
+/// One runner for both front ends, so `/tools off getWeather` cannot mean one
+/// thing here and another in the app.
+let commands = CommandRunner(agent: agent, settingsStore: settingsStore, sessions: sessionStore)
+
+/// The line editor, given a way to enumerate the things worth completing.
+///
+/// Tool names and session names are read live rather than captured once, so
+/// completion reflects a `/tools off` or a `/save` from earlier in the session.
+let editor = LineEditor(
+    toolNames: { knownToolNames.sorted() },
+    sessionNames: { sessionStore.names }
+)
+editor.install()
+
+note("marlo — assistant on this Mac · context \(await agent.contextSize) tokens · \(MarloCommands.all.count) commands, type / for a list\n\n")
+
+/// Print a command's output, indented and framed like the rest of the session.
+@MainActor
+func show(_ text: String) {
+    guard !text.isEmpty else { return }
+    note("\n")
+    for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+        note(line.isEmpty ? "\n" : "  \(line)\n")
+    }
+    note("\n")
+}
+
+/// Read new instructions from the terminal, multi-line.
+///
+/// This is the one command that cannot be a pure string transformation: it needs
+/// the interface to gather input, which is why the runner hands it back as a
+/// follow-up instead of trying to prompt for itself.
+@MainActor
+func editInstructionsInteractively() async {
+    note("\n  Enter the new instructions. An empty line finishes.\n\n")
+    var lines: [String] = []
+    while let line = editor.read(prompt: "  ") {
+        if line.isEmpty { break }
+        lines.append(line)
+    }
+    guard !lines.isEmpty else {
+        note("\n  cancelled\n\n")
+        return
+    }
+    let text = lines.joined(separator: "\n")
+    await commands.setInstructions(text)
+    note("\n  instructions updated (\(text.count) characters)\n\n")
+}
+
+// MARK: The loop
 
 while true {
-    note("› ")
-    guard let line = readLine() else { break }
+    guard let line = editor.read(prompt: "› ") else { break }
     let input = line.trimmingCharacters(in: .whitespacesAndNewlines)
     if input.isEmpty { continue }
 
-    switch input {
-    case "/quit", "/exit", "/q":
-        note("\n")
-        exit(0)
-
-    case "/new", "/clear":
-        await agent.reset()
-        note("  started a new conversation\n\n")
-        continue
-
-    case "/tools":
-        note("\n")
-        for tool in await agent.describeTools() {
-            let flag = tool.mutating ? " [asks approval]" : ""
-            let state = tool.enabled ? "on " : "off"
-            note("  [\(state)] \(tool.name)\(flag)\n    \(tool.summary)\n")
+    if let outcome = await commands.run(input) {
+        switch outcome.followUp {
+        case .quit:
+            note("\n")
+            exit(0)
+        case .editInstructions:
+            await editInstructionsInteractively()
+        case nil:
+            show(outcome.output)
         }
-        note("\n  /tools on <name> | /tools off <name> | /tools only <name,...>\n\n")
         continue
-
-    case let command where command.hasPrefix("/tools "):
-        let parts = command.dropFirst("/tools ".count)
-            .split(separator: " ", maxSplits: 1)
-            .map(String.init)
-        let action = parts.first?.lowercased() ?? ""
-        let names = parts.count > 1
-            ? parts[1].split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
-            : []
-        note("\n")
-        switch action {
-        case "on", "off", "enable", "disable":
-            let enabled = action == "on" || action == "enable"
-            if names.isEmpty {
-                note("  usage: /tools \(enabled ? "on" : "off") <name>[,<name>...]\n\n")
-                continue
-            }
-            for name in names {
-                let ok = await agent.setTool(name, enabled: enabled)
-                note(ok
-                    ? "  \(name): \(enabled ? "enabled" : "disabled")\n"
-                    : "  unknown tool: \(name)\n")
-            }
-        case "only":
-            if names.isEmpty {
-                note("  usage: /tools only <name>[,<name>...]\n\n")
-                continue
-            }
-            let known = Set(await agent.toolNames)
-            let unknown = names.filter { !known.contains($0) }
-            for name in unknown { note("  unknown tool: \(name)\n") }
-            let keep = names.filter { known.contains($0) }
-            await agent.setAllTools(enabled: false)
-            for name in keep { await agent.setTool(name, enabled: true) }
-            note("  enabled: \(keep.joined(separator: ", "))\n")
-        case "all":
-            await agent.setAllTools(enabled: true)
-            note("  all tools enabled\n")
-        case "none":
-            await agent.setAllTools(enabled: false)
-            note("  all tools disabled — answers come from the model alone\n")
-        default:
-            note("  usage: /tools [on|off|only|all|none] <name,...>\n")
-        }
-        note("\n")
-        continue
-
-    case let command where command == "/offline" || command.hasPrefix("/offline "):
-        let names = Set(await agent.toolNames)
-        let networkNames = await agent.toolNames.filter { networkToolNames.contains($0) }
-        let enabled = Set(await agent.enabledToolNames)
-        let anyNetworkOn = networkNames.contains { enabled.contains($0) }
-
-        // Bare `/offline` toggles: if any network tool is on, turn them all off;
-        // if none are on, turn them all back on. An explicit `on`/`off` is absolute.
-        let argument = command.dropFirst("/offline".count).trimmingCharacters(in: .whitespaces).lowercased()
-        let turnOn: Bool
-        switch argument {
-        case "on", "enable": turnOn = true
-        case "off", "disable": turnOn = false
-        case "": turnOn = !anyNetworkOn
-        default:
-            note("\n  usage: /offline [on|off]\n\n")
-            continue
-        }
-
-        note("\n")
-        for name in networkNames where names.contains(name) {
-            await agent.setTool(name, enabled: turnOn)
-        }
-        note(turnOn
-            ? "  network tools on\n\n"
-            : "  network tools off — answers come from the model alone\n\n")
-        continue
-
-    case "/tokens":
-        let used = await agent.usedTokens()
-        let limit = await agent.contextSize
-        let percent = limit > 0 ? used * 100 / limit : 0
-        note("  \(used) / \(limit) tokens (\(percent)%)\n\n")
-        continue
-
-    case "/help":
-        note("\n" + usage() + "\n\n")
-        continue
-
-    default:
-        break
     }
 
     await respond(to: input)

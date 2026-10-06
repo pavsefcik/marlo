@@ -3,59 +3,11 @@ import FoundationModels
 import MarloKit
 import SwiftUI
 
-/// One rendered tool call in a conversation.
-struct ToolRun: Identifiable, Sendable {
-    let id = UUID()
-    var name: String
-    var arguments: String
-    var result: String?
-
-    var failed: Bool { result?.hasPrefix("error:") ?? false }
-    var isRunning: Bool { result == nil }
-
-    /// Pretty-printed arguments, so the card is legible without reading raw JSON.
-    var prettyArguments: String {
-        guard let data = arguments.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data),
-              let pretty = try? JSONSerialization.data(
-                  withJSONObject: object, options: [.prettyPrinted, .sortedKeys]
-              ),
-              let text = String(data: pretty, encoding: .utf8)
-        else { return arguments }
-        return text
-    }
-
-    var resultPreview: String {
-        guard let result else { return "" }
-        let oneLine = result.replacingOccurrences(of: "\n", with: " · ")
-        return oneLine.count > 300 ? String(oneLine.prefix(300)) + "…" : oneLine
-    }
-}
-
 struct ChatMessage: Identifiable, Sendable {
     enum Role: Sendable { case user, assistant }
     let id = UUID()
     var role: Role
     var text: String
-    var tools: [ToolRun] = []
-}
-
-/// A tool call suspended on the user's decision.
-struct PendingApproval: Identifiable, Sendable {
-    let id = UUID()
-    var toolName: String
-    var arguments: String
-
-    var prettyArguments: String {
-        guard let data = arguments.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data),
-              let pretty = try? JSONSerialization.data(
-                  withJSONObject: object, options: [.prettyPrinted, .sortedKeys]
-              ),
-              let text = String(data: pretty, encoding: .utf8)
-        else { return arguments }
-        return text
-    }
 }
 
 @MainActor
@@ -68,45 +20,35 @@ final class ChatViewModel {
     var isResponding = false
     /// Complete text of the in-flight answer. Always *replaced*, never appended.
     var streamingText = ""
-    var streamingTools: [ToolRun] = []
     var errorMessage: String?
-    var pendingApproval: PendingApproval?
     var status: String?
 
     var isAvailable = true
     var unavailableReason: String?
-    var autoApprove = false
+
+    /// Persisted preferences shared with the CLI.
+    var settings: MarloSettings
+    private let settingsStore: SettingsStore
 
     var usedTokens = 0
     var contextLimit = 8192
-    private(set) var tools: [ToolDescriptor] = []
-
-    /// Tools that reach the network, so the UI can offer one switch.
-    /// `nonisolated` so the nested `ToolDescriptor` can consult it.
-    nonisolated static let networkTools: Set<String> = [
-        "getWeather", "wikipediaSummary", "convertCurrency", "getCryptoPrice",
-        "airQuality", "sunriseSunset", "recentEarthquakes",
-        "upcomingPublicHolidays", "liveAirTraffic",
-    ]
-
-    struct ToolDescriptor: Identifiable, Sendable {
-        var id: String { name }
-        var name: String
-        var summary: String
-        var mutating: Bool
-        var enabled: Bool
-        var isNetwork: Bool { ChatViewModel.networkTools.contains(name) }
-    }
 
     // MARK: Internals
 
     private let agent: Agent
     private var turnTask: Task<Void, Never>?
-    private var approvalContinuation: CheckedContinuation<Bool, Never>?
 
-    init() {
+    /// Every tool the library ships.
+    ///
+    /// Listed rather than omitted so the wiring below is a single visible
+    /// decision. Marlo in the app is a local chatbot: it answers from the model
+    /// and nothing else. The tools, the router, the command runner and the
+    /// session store are all still in `MarloKit`, still built and still covered
+    /// by its tests — the app simply does not offer them. To bring them back,
+    /// stop hiding the definitions and drop the two `false`s in `init`.
+    private static let allTools: [AnyAssistantTool] = {
         let memory = MemoryStore()
-        let all: [AnyAssistantTool] = [
+        return [
             AnyAssistantTool(CurrentTimeTool()),
             AnyAssistantTool(RememberFactTool(store: memory)),
             AnyAssistantTool(RecallMemoryTool(store: memory)),
@@ -120,19 +62,37 @@ final class ChatViewModel {
             AnyAssistantTool(HolidayTool()),
             AnyAssistantTool(AirTrafficTool()),
         ]
-        self.agent = Agent(tools: all)
+    }()
+
+    init() {
+        let store = SettingsStore()
+        let settings = store.current
+        self.settingsStore = store
+        self.settings = settings
+
+        let definitions = Self.allTools
+        self.agent = Agent(
+            definitions: definitions,
+            instructions: settings.instructions,
+            // Dormant: hiding every definition means none is declared to the
+            // model, so no tool can be called and none costs context.
+            disabled: Set(definitions.map(\.name)),
+            routingEnabled: false,
+            routingThreshold: settings.routingThreshold,
+            styleInstruction: settings.responseStyle.instruction,
+            model: settings.model
+        )
     }
 
-    /// Wire callbacks, check availability, load tools. Call once on appear.
+    /// Check availability and prime the token meter. Call once on appear.
     func start() async {
+        // No approval handler: with every tool hidden nothing can run, and an
+        // unset handler refuses by default rather than silently allowing.
         await agent.configure(
             onEvent: { [weak self] event in
                 Task { @MainActor [weak self] in self?.handle(event) }
             },
-            onApproval: { [weak self] name, arguments in
-                guard let self else { return false }
-                return await self.requestApproval(name: name, arguments: arguments)
-            }
+            onApproval: nil
         )
 
         switch await agent.availability {
@@ -147,7 +107,6 @@ final class ChatViewModel {
         }
 
         contextLimit = await agent.contextSize
-        await reloadTools()
         await refreshTokens()
     }
 
@@ -162,7 +121,6 @@ final class ChatViewModel {
         status = nil
         messages.append(ChatMessage(role: .user, text: prompt))
         streamingText = ""
-        streamingTools = []
         isResponding = true
 
         turnTask = Task { [weak self] in
@@ -193,16 +151,11 @@ final class ChatViewModel {
 
     private func finishTurn() async {
         if !streamingText.isEmpty {
-            messages.append(
-                ChatMessage(role: .assistant, text: streamingText, tools: streamingTools)
-            )
+            messages.append(ChatMessage(role: .assistant, text: streamingText))
         }
         streamingText = ""
-        streamingTools = []
         isResponding = false
         status = nil
-        // A cancelled turn may leave a tool awaiting an answer.
-        resolveApproval(false)
     }
 
     func newConversation() {
@@ -212,7 +165,6 @@ final class ChatViewModel {
             await agent.reset()
             messages = []
             streamingText = ""
-            streamingTools = []
             errorMessage = nil
             isResponding = false
             await refreshTokens()
@@ -220,7 +172,8 @@ final class ChatViewModel {
     }
 
     private func refreshTokens() async {
-        usedTokens = await agent.usedTokens()
+        usedTokens = await agent.reportedTokens()
+        contextLimit = await agent.contextSize
     }
 
     var contextFraction: Double {
@@ -228,66 +181,32 @@ final class ChatViewModel {
         return min(1, Double(usedTokens) / Double(contextLimit))
     }
 
+    /// Whether the conversation can be cleared.
+    var hasConversation: Bool {
+        !messages.isEmpty || !streamingText.isEmpty
+    }
+
+    func setResponseStyle(_ style: ResponseStyle) {
+        Task {
+            var settings = settings
+            settings.responseStyle = style
+            self.settings = settings
+            settingsStore.update(settings)
+            await agent.apply(settings: settings)
+            await refreshTokens()
+        }
+    }
+
     // MARK: Agent events
 
     private func handle(_ event: AgentEvent) {
+        // Only retries can surface with no tools configured. The tool and
+        // routing cases are handled by the CLI, which does offer them.
         switch event {
-        case .toolStarted(let name, let arguments):
-            streamingTools.append(ToolRun(name: name, arguments: arguments))
-
-        case .toolFinished(let name, let result):
-            if let index = streamingTools.lastIndex(where: { $0.name == name && $0.result == nil }) {
-                streamingTools[index].result = result
-            }
-
         case .modelRetry(let attempt, let reason):
             status = "Retrying (\(attempt)) after \(reason)…"
+        case .toolStarted, .toolFinished, .routing:
+            break
         }
-    }
-
-    // MARK: Approval
-
-    private func requestApproval(name: String, arguments: String) async -> Bool {
-        if autoApprove { return true }
-        return await withCheckedContinuation { continuation in
-            approvalContinuation = continuation
-            pendingApproval = PendingApproval(toolName: name, arguments: arguments)
-        }
-    }
-
-    func resolveApproval(_ approved: Bool) {
-        pendingApproval = nil
-        approvalContinuation?.resume(returning: approved)
-        approvalContinuation = nil
-    }
-
-    // MARK: Tools
-
-    private func reloadTools() async {
-        tools = await agent.describeTools().map {
-            ToolDescriptor(name: $0.name, summary: $0.summary, mutating: $0.mutating, enabled: $0.enabled)
-        }
-    }
-
-    func toggleTool(_ name: String, enabled: Bool) {
-        Task {
-            await agent.setTool(name, enabled: enabled)
-            await reloadTools()
-            await refreshTokens()
-        }
-    }
-
-    func setNetworkTools(enabled: Bool) {
-        Task {
-            for name in Self.networkTools {
-                await agent.setTool(name, enabled: enabled)
-            }
-            await reloadTools()
-            await refreshTokens()
-        }
-    }
-
-    var networkEnabled: Bool {
-        tools.contains { $0.isNetwork && $0.enabled }
     }
 }

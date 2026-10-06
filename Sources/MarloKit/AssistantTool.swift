@@ -25,11 +25,18 @@ public protocol AssistantTool: Sendable {
     var summary: String { get }
     /// Side-effecting tools pause for approval when a user is at the keyboard.
     var isMutating: Bool { get }
+    /// Whether this tool reaches the network.
+    ///
+    /// Declared here rather than kept in a list by each interface: the fact
+    /// belongs to the tool, and a hardcoded list in the CLI plus another in the
+    /// UI is two chances to forget one when a tool is added.
+    var isNetwork: Bool { get }
     func run(_ arguments: Arguments) async throws -> String
 }
 
 extension AssistantTool {
     public var isMutating: Bool { false }
+    public var isNetwork: Bool { false }
 }
 
 // MARK: - Type erasure
@@ -40,12 +47,14 @@ public struct AnyAssistantTool: Sendable {
     public let name: String
     public let summary: String
     public let isMutating: Bool
+    public let isNetwork: Bool
     let bridge: @Sendable (ToolEventSink) -> any Tool
 
     public init<T: AssistantTool>(_ tool: T) {
         self.name = tool.name
         self.summary = tool.summary
         self.isMutating = tool.isMutating
+        self.isNetwork = tool.isNetwork
         self.bridge = { sink in BridgedTool(base: tool, sink: sink) }
     }
 }
@@ -233,6 +242,8 @@ public struct CurrentTimeTool: AssistantTool {
 
 public struct WeatherTool: AssistantTool {
     public let name = "getWeather"
+    /// Reaches the network: hidden by `/offline`.
+    public let isNetwork = true
 
     public init() {}
     public let summary = """
@@ -495,6 +506,8 @@ public struct RecallMemoryTool: AssistantTool {
 
 public struct WikipediaTool: AssistantTool {
     public let name = "wikipediaSummary"
+    /// Reaches the network: hidden by `/offline`.
+    public let isNetwork = true
 
     public init() {}
     public let summary = """
@@ -572,6 +585,8 @@ struct SearchResponse: Decodable {
 
 public struct CurrencyTool: AssistantTool {
     public let name = "convertCurrency"
+    /// Reaches the network: hidden by `/offline`.
+    public let isNetwork = true
 
     public init() {}
     public let summary = """
@@ -613,6 +628,8 @@ struct RateResponse: Decodable {
 
 public struct CryptoPriceTool: AssistantTool {
     public let name = "getCryptoPrice"
+    /// Reaches the network: hidden by `/offline`.
+    public let isNetwork = true
 
     public init() {}
     public let summary = "Get the current spot price in US dollars for a cryptocurrency such as BTC, ETH or SOL."
@@ -638,6 +655,8 @@ public struct CryptoPriceTool: AssistantTool {
 
 public struct AirQualityTool: AssistantTool {
     public let name = "airQuality"
+    /// Reaches the network: hidden by `/offline`.
+    public let isNetwork = true
 
     public init() {}
     public let summary = "Get the current air quality and pollution level for a city."
@@ -687,6 +706,8 @@ struct AirQualityResponse: Decodable {
 
 public struct SunTool: AssistantTool {
     public let name = "sunriseSunset"
+    /// Reaches the network: hidden by `/offline`.
+    public let isNetwork = true
 
     public init() {}
     public let summary = "Get today's sunrise, sunset and daylight length for a city."
@@ -741,6 +762,8 @@ struct SunResponse: Decodable {
 
 public struct EarthquakeTool: AssistantTool {
     public let name = "recentEarthquakes"
+    /// Reaches the network: hidden by `/offline`.
+    public let isNetwork = true
 
     public init() {}
     public let summary = "List recent significant earthquakes worldwide from the US Geological Survey."
@@ -795,6 +818,8 @@ struct QuakeResponse: Decodable {
 
 public struct HolidayTool: AssistantTool {
     public let name = "upcomingPublicHolidays"
+    /// Reaches the network: hidden by `/offline`.
+    public let isNetwork = true
 
     public init() {}
     public let summary = "List upcoming public holidays for a country."
@@ -880,6 +905,8 @@ enum CountryCodes {
 /// has no such limit in testing.
 public struct AirTrafficTool: AssistantTool {
     public let name = "liveAirTraffic"
+    /// Reaches the network: hidden by `/offline`.
+    public let isNetwork = true
 
     public init() {}
     public let summary = """
@@ -1015,5 +1042,28 @@ enum Airports {
             lock.lock(); defer { lock.unlock() }
             table[key] = airport
         }
+    }
+}
+
+// MARK: - Description
+
+/// What an interface needs to know about a tool to show and toggle it.
+///
+/// A named type rather than a tuple because the CLI, the UI and the tests all
+/// destructure it, and a tuple's field order is easy to get wrong silently.
+public struct ToolDescription: Sendable, Identifiable, Equatable {
+    public var id: String { name }
+    public let name: String
+    public let summary: String
+    public let mutating: Bool
+    public let network: Bool
+    public let enabled: Bool
+
+    public init(name: String, summary: String, mutating: Bool, network: Bool, enabled: Bool) {
+        self.name = name
+        self.summary = summary
+        self.mutating = mutating
+        self.network = network
+        self.enabled = enabled
     }
 }

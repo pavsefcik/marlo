@@ -28,6 +28,15 @@ CLEAN=0
 APP_NAME="Marlo"
 BUNDLE_ID="dev.local.marlo"
 
+# The version lives in Sources/MarloKit/Version.swift, so the CLI's --version,
+# the app bundle, and the release tag all read one number.
+VERSION="$(sed -n 's/.*public static let current = "\([^"]*\)".*/\1/p' \
+    "$PWD/Sources/MarloKit/Version.swift")"
+if [[ -z "$VERSION" ]]; then
+    echo "error: could not read the version from Sources/MarloKit/Version.swift" >&2
+    exit 1
+fi
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --release)   CONFIG="release"; BINARY="$PWD/.build/$CONFIG/MarloApp"; shift ;;
@@ -74,8 +83,8 @@ cat > "$DEST/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
   <key>CFBundleExecutable</key><string>MarloApp</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>27.0</string>
   <key>LSUIElement</key><true/>
   <key>NSHighResolutionCapable</key><true/>
